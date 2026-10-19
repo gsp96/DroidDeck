@@ -1,0 +1,51 @@
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install Cargo NDK & Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y zstd ninja-build
+          cargo install cargo-ndk --locked
+      - name: Cache Gradle packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      - name: Build APK with Gradle
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleRelease --stacktrace
+      - name: Sign APK with Test Key
+        run: |
+          set -euo pipefail
+          APK=$(find app/build/outputs/apk/release -name '*.apk' | head -1)
+          TOOLS=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -type d | sort -V | tail -1)
+          "$TOOLS/zipalign" -p -f 4 "$APK" "$APK.aligned"
+          "$TOOLS/apksigner" sign \
+            --ks keystore/testkey.p12 --ks-type PKCS12 --ks-pass pass:android \
+            --ks-key-alias testkey --key-pass pass:android \
+            --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true \
+            --out "$APK" "$APK.aligned"
+          rm -f "$APK.aligned" "$APK.idsig"
+          echo "SIGNED_APK=$APK" >> $GITHUB_ENV
+      - name: Create or Update GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="latest-automated"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          TITLE="DroidDeck Automated Build ($SHORT_SHA)"
+          BODY="Upstream Sync & Automated Build from commit $GITHUB_SHA.
+          
+          - Built at: $(date -u)
+          - Source Commit: https://github.com/Droid-Deck/DroidDeck/commit/$GITHUB_SHA"
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$TAG" "$SIGNED_APK" \
+            --title "$TITLE" \
+            --notes "$BODY" \
+            --prerelease=false
