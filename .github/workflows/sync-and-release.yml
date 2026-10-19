@@ -1,11 +1,74 @@
+name: Auto Sync Upstream & Release APK
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # 매일 한국 시간 새벽 3시(UTC 18:00) 자동 실행
+  workflow_dispatch:     # 웹에서 Run workflow 버튼으로 즉시 실행
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: sync-and-release
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    name: Sync Upstream
+    runs-on: ubuntu-latest
+    outputs:
+      has_new_commits: ${{ steps.sync.outputs.has_new_commits }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync with Upstream
+        id: sync
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          upstream_sync_repo: Droid-Deck/DroidDeck
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+  build-and-release:
+    name: Build & Publish Release APK
+    needs: sync
+    if: always() && (needs.sync.outputs.has_new_commits == 'true' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android
+
       - name: Install Cargo NDK & Dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y zstd ninja-build
           cargo install cargo-ndk --locked
+
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -15,10 +78,12 @@
           key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-
+
       - name: Build APK with Gradle
         run: |
           chmod +x ./gradlew
           ./gradlew :app:assembleRelease --stacktrace
+
       - name: Sign APK with Test Key
         run: |
           set -euo pipefail
@@ -32,6 +97,7 @@
             --out "$APK" "$APK.aligned"
           rm -f "$APK.aligned" "$APK.idsig"
           echo "SIGNED_APK=$APK" >> $GITHUB_ENV
+
       - name: Create or Update GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -44,6 +110,7 @@
           
           - Built at: $(date -u)
           - Source Commit: https://github.com/Droid-Deck/DroidDeck/commit/$GITHUB_SHA"
+
           gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" "$SIGNED_APK" \
             --title "$TITLE" \
